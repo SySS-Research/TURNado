@@ -1,0 +1,13 @@
+*.test
+*.out
+/bin/
+/build/
+/dist/
+.DS_Store
+.idea/
+.vscode/
+*.log
+/turnado
+/turnado.exe
+go.sum
+.gocache/
