@@ -42,6 +42,9 @@ func RunTunnel(argv []string) error {
 		if err := requireTurn(fs, cfg.Common.Turn); err != nil {
 			return err
 		}
+		if err := validateCommon(cfg.Common); err != nil {
+			return err
+		}
 	}
 	return runTunnelAutoTun(cfg)
 }

@@ -260,6 +260,20 @@ As shown above, only 3917 allocations were made successfully before the TURN ser
 
 
 
+## Proxy support
+
+Some enterprise infrastructures require proxy use even for non-HTTP protocols.
+Therefore, turnado can route the connection to the TURN server through a proxy via the `--proxy` flag.
+
+Supported schemes: `socks5://`, `socks5h://`, `http://`, `https://` (with optional `user:pass@` credentials).
+
+```sh
+turnado info -t worldaz-msit.relay.teams.microsoft.com:443 -T tls --proxy socks5://127.0.0.1:1080 -u <username> -p <password>
+
+turnado socks -t <turnserver>:443 -T tls --proxy http://user:pass@proxy.local:8080 -u <username> -p <password>
+```
+
+
 ## Blog Post
 
 For more information on how to use it, common TURN pitfalls, and countermeasures, check out the [blog post](https://blog.syss.com/posts/turnado/)!

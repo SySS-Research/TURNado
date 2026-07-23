@@ -2,7 +2,6 @@ package app
 
 import (
 	"crypto/rand"
-	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
@@ -20,8 +19,7 @@ const (
 	attrRequestedTrans stun.AttrType = 0x0019
 )
 
-func probeServerInfo(turnAddr string, controlTransport string, insecure bool, timeout time.Duration, requestedProto byte) (string, string, error) {
-	cfg := commonConfig{Turn: turnAddr, Transport: controlTransport, Insecure: insecure, Timeout: timeout}
+func probeServerInfo(cfg commonConfig, requestedProto byte) (string, string, error) {
 	pc, closeFn, err := dialControlConn(cfg)
 	if err != nil {
 		return "", "", err
@@ -40,9 +38,9 @@ func probeServerInfo(turnAddr string, controlTransport string, insecure bool, ti
 	m.Add(attrRequestedTrans, val)
 	m.Encode()
 
-	_ = pc.SetDeadline(time.Now().Add(timeout))
-	if controlTransport == "udp" {
-		ua, rerr := net.ResolveUDPAddr("udp", turnAddr)
+	_ = pc.SetDeadline(time.Now().Add(cfg.Timeout))
+	if cfg.Transport == "udp" {
+		ua, rerr := net.ResolveUDPAddr("udp", cfg.Turn)
 		if rerr != nil {
 			return "", "", rerr
 		}
@@ -127,13 +125,10 @@ func resolveProbeAddrs(turnAddr, probe string) (*net.UDPAddr, *net.TCPAddr, stri
 }
 
 func dialTurnDataConn(cfg commonConfig) (net.Conn, error) {
-	d := &net.Dialer{Timeout: cfg.Timeout}
 	if cfg.Transport == "tls" {
-		tc := &tls.Config{InsecureSkipVerify: cfg.Insecure}
-		return tls.DialWithDialer(d, "tcp", cfg.Turn, tc)
+		return dialServerTLS(cfg)
 	}
-
-	return d.Dial("tcp", cfg.Turn)
+	return dialServerTCP(cfg)
 }
 
 func isConnectBindSupported(err error) bool {
@@ -173,6 +168,9 @@ func RunInfo(argv []string) error {
 	if err := requireTurn(fs, cfg.Turn); err != nil {
 		return err
 	}
+	if err := validateCommon(cfg); err != nil {
+		return err
+	}
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
@@ -181,11 +179,11 @@ func RunInfo(argv []string) error {
 		return err
 	}
 
-	realmUDP, softwareUDP, err := probeServerInfo(cfg.Turn, cfg.Transport, cfg.Insecure, cfg.Timeout, 17)
+	realmUDP, softwareUDP, err := probeServerInfo(cfg, 17)
 	if err != nil && cfg.Verbose > 0 {
 		log.Printf("UDP realm probe failed: %v", err)
 	}
-	realmTCP, softwareTCP, err := probeServerInfo(cfg.Turn, cfg.Transport, cfg.Insecure, cfg.Timeout, 6)
+	realmTCP, softwareTCP, err := probeServerInfo(cfg, 6)
 	if err != nil && cfg.Verbose > 0 {
 		log.Printf("TCP realm probe failed: %v", err)
 	}
