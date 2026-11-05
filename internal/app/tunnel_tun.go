@@ -1,13 +1,11 @@
 package app
 
 import (
-	"bufio"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"net"
-	"os"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -85,247 +83,78 @@ func (r *fragReassembler) cleanup(now time.Time) {
 	}
 }
 
-func runAutoClientTun(cfg tunnelCfg) error {
-	if err := ensureEncKey(&cfg); err != nil {
-		return err
-	}
-	client, _, cleanup, err := newTurnClient(cfg.Common)
-	if err != nil {
-		return err
-	}
-	defer cleanup()
-
-	if mapped, err := client.SendBindingRequestTo(client.TURNServerAddr()); err == nil && cfg.Common.Verbose > 0 {
-		log.Printf("XOR-MAPPED-ADDRESS: %s", mapped.String())
-	}
-
-	relayConn, err := client.Allocate()
-	if err != nil {
-		return fmt.Errorf("Allocate (UDP) failed: %w", err)
-	}
-	defer relayConn.Close()
-
-	relayAddr := relayConn.LocalAddr().String()
-	log.Printf("TURN UDP relay allocated at: %s", relayAddr)
-
-	if err := printThisConnString(cfg, relayAddr); err != nil {
-		return err
-	}
-
-	ps := newPeerState()
-	keyBytes, _ := decodeEncKey(cfg.EncKey)
-	sec := newSecureSession(cfg.Encrypt, keyBytes)
-
-	go func() {
-		sc := bufio.NewScanner(os.Stdin)
-		for sc.Scan() {
-			line := strings.TrimSpace(sc.Text())
-			if line == "" {
-				continue
-			}
-			cs, err := decodeConnString(line)
-			if err != nil {
-				log.Printf("Pairing input ignored (not a valid connection string): %v", err)
-				continue
-			}
-			peerUDP, err := net.ResolveUDPAddr("udp", cs.Relay)
-			if err != nil {
-				log.Printf("Pairing failed: resolve peer relay: %v", err)
-				continue
-			}
-			if !ps.setPeerOnce(peerUDP) {
-				log.Printf("Already paired; ignoring additional connection string.")
-				continue
-			}
-			if err := client.CreatePermission(peerUDP); err != nil {
-				log.Printf("Pairing failed: CreatePermission(%s): %v", peerUDP.String(), err)
-				log.Printf("Paired peer set, but permission failed; tunnel likely won't pass traffic.")
-				return
-			}
-			log.Printf("Paired! Permission created for peer %s", peerUDP.String())
-			primeChannel(relayConn, peerUDP, sec, cfg.Common.Verbose)
-			if sec != nil {
-				if err := sec.Start(peerUDP); err != nil {
-					log.Printf("Encrypt setup failed: %v", err)
-				}
-			}
-			return
-		}
-		if err := sc.Err(); err != nil {
-			log.Printf("stdin scanner error: %v", err)
-		}
-	}()
-
-	return runTurnTunClientWithLatePeer(relayConn, ps, sec, "turn%d", cfg.Common.Verbose)
+func runTurnTunClientWithLatePeer(relayConn *peerTransport, cfg tunnelCfg, verbose int) error {
+	return runTunEndpoint(relayConn, cfg, cfg.ClientIP, false, verbose)
 }
 
-func runAutoExitTun(cfg tunnelCfg) error {
-	offer, err := decodeConnString(cfg.Connect)
-	if err != nil {
-		return err
-	}
-	applyConnStringDefaults(&cfg, offer)
-	if err := ensureEncKey(&cfg); err != nil {
-		return err
-	}
-
-	client, _, cleanup, err := newTurnClient(cfg.Common)
-	if err != nil {
-		return err
-	}
-	defer cleanup()
-
-	if mapped, err := client.SendBindingRequestTo(client.TURNServerAddr()); err == nil && cfg.Common.Verbose > 0 {
-		log.Printf("XOR-MAPPED-ADDRESS: %s", mapped.String())
-	}
-
-	relayConn, err := client.Allocate()
-	if err != nil {
-		return fmt.Errorf("Allocate (UDP) failed: %w", err)
-	}
-	defer relayConn.Close()
-
-	relayAddr := relayConn.LocalAddr().String()
-	log.Printf("TURN UDP relay allocated at: %s", relayAddr)
-
-	peerUDP, err := net.ResolveUDPAddr("udp", offer.Relay)
-	if err != nil {
-		return fmt.Errorf("ResolveUDPAddr(peer=%q) failed: %w", offer.Relay, err)
-	}
-
-	if err := client.CreatePermission(peerUDP); err != nil {
-		return fmt.Errorf("CreatePermission(%s) failed: %w", peerUDP.String(), err)
-	}
-	log.Printf("Permission created for peer %s", peerUDP.String())
-
-	if err := printThisConnString(cfg, relayAddr); err != nil {
-		return err
-	}
-
-	keyBytes, _ := decodeEncKey(cfg.EncKey)
-	sec := newSecureSession(cfg.Encrypt, keyBytes)
-	if sec != nil {
-		if err := sec.Start(peerUDP); err != nil {
-			return err
-		}
-	}
-	primeChannel(relayConn, peerUDP, sec, cfg.Common.Verbose)
-
-	log.Printf("Exit role active: accepting IP packets over TURN.")
-	return runTurnTunExit(relayConn, peerUDP, sec, "turn%d", cfg.Common.Verbose)
+func runTurnTunExit(relayConn *peerTransport, cfg tunnelCfg, verbose int) error {
+	return runTunEndpoint(relayConn, cfg, cfg.ExitIP, true, verbose)
 }
 
-func runTurnTunClientWithLatePeer(relayConn net.PacketConn, ps *peerState, sec *secureSession, tunName string, verbose int) error {
-	tun, err := openTun(tunName)
+func runTunEndpoint(relayConn *peerTransport, cfg tunnelCfg, address string, exit bool, verbose int) error {
+	tun, err := openTun("turn%d")
 	if err != nil {
 		return err
 	}
 	defer tun.Close()
-	if err := configureTun(tun.name, "10.0.1.2", "255.255.255.0"); err != nil {
+	peerIP := cfg.ExitIP
+	if exit {
+		peerIP = cfg.ClientIP
+	}
+	if err := configureTun(tun.name, address, peerIP, "255.255.255.0", relayConn.maxPayload()); err != nil {
 		return err
 	}
 	log.Printf("TUN device opened: %s", tun.name)
-
-	reasm := newFragReassembler()
-
-	// TURN -> TUN
-	go func() {
-		if err := turnToTunLoop(relayConn, tun, sec, reasm, verbose); err != nil && !isClosedErr(err) && verbose > 0 {
-			log.Printf("relay read error: %v", err)
-		}
-	}()
-
-	<-ps.paired
-	peer := ps.getPeer()
-	if peer == nil {
-		return fmt.Errorf("missing peer for TUN traffic")
-	}
-
-	// TUN -> TURN
-	buf := make([]byte, 64*1024)
-	for {
-		n, err := tun.Read(buf)
-		if err != nil {
-			return fmt.Errorf("tun read error: %w", err)
-		}
-		if n == 0 {
-			continue
-		}
-		if err := sendTunPayload(relayConn, peer, sec, buf[:n]); err != nil {
-			return err
-		}
-	}
+	return runTunSession(relayConn, tun, verbose)
 }
 
-func runTurnTunExit(relayConn net.PacketConn, peerUDP *net.UDPAddr, sec *secureSession, tunName string, verbose int) error {
-	tun, err := openTun(tunName)
+// Either pump failing closes both resources and unblocks the other pump. In
+// particular a lost TURN control connection must not leave an idle TUN hanging.
+func runTunSession(relayConn *peerTransport, tun io.ReadWriteCloser, verbose int) error {
+	defer tun.Close()
+	peer, err := relayConn.waitPeer()
 	if err != nil {
 		return err
 	}
-	defer tun.Close()
-	if err := configureTun(tun.name, "10.0.1.1", "255.255.255.0"); err != nil {
-		return err
-	}
-	log.Printf("TUN device opened: %s", tun.name)
-
-	reasm := newFragReassembler()
-
-	// TUN -> TURN
+	results := make(chan error, 2)
+	go func() {
+		err := turnToTunLoop(relayConn, tun, newFragReassembler(), verbose)
+		results <- fmt.Errorf("TURN to TUN: %w", err)
+	}()
 	go func() {
 		buf := make([]byte, 64*1024)
 		for {
 			n, err := tun.Read(buf)
 			if err != nil {
-				if verbose > 0 {
-					log.Printf("tun read error: %v", err)
-				}
+				results <- fmt.Errorf("TUN read: %w", err)
 				return
 			}
 			if n == 0 {
 				continue
 			}
-			if err := sendTunPayload(relayConn, peerUDP, sec, buf[:n]); err != nil {
+			if err := sendTunPayload(relayConn, peer, buf[:n]); err != nil {
+				results <- fmt.Errorf("TUN to TURN: %w", err)
 				return
 			}
 		}
 	}()
-
-	// TURN -> TUN
-	if err := turnToTunLoop(relayConn, tun, sec, reasm, verbose); err != nil {
-		if isClosedErr(err) {
-			return nil
-		}
-		return fmt.Errorf("exit relay read error: %w", err)
+	err = <-results
+	_ = tun.Close()
+	_ = relayConn.Close()
+	<-results
+	if isClosedErr(err) {
+		return nil
 	}
-	return nil
+	return err
 }
 
-func handleTunInbound(pkt []byte, tun *tunDevice, sec *secureSession, reasm *fragReassembler, verbose int) {
+func handleTunInbound(pkt []byte, tun io.Writer, reasm *fragReassembler, verbose int) {
 	h, payload, err := parseHeader(pkt)
 	if err != nil {
 		if verbose > 0 {
 			log.Printf("tun: bad packet: %v", err)
 		}
 		return
-	}
-	if h.Type == msgTypeSecure {
-		if sec == nil {
-			return
-		}
-		inner, err := sec.unwrapInbound(payload)
-		if err != nil {
-			if verbose > 0 {
-				log.Printf("tun: decrypt failed: %v", err)
-			}
-			return
-		}
-		h, payload, err = parseHeader(inner)
-		if err != nil {
-			if verbose > 0 {
-				log.Printf("tun: bad inner packet: %v", err)
-			}
-			return
-		}
 	}
 	switch h.Type {
 	case msgTypeIP:
@@ -362,21 +191,18 @@ func handleTunInbound(pkt []byte, tun *tunDevice, sec *secureSession, reasm *fra
 
 var fragSeq uint32
 
-func sendTunPayload(relayConn net.PacketConn, peer *net.UDPAddr, sec *secureSession, data []byte) error {
-	maxPayload := maxDataPayload(sec)
+func sendTunPayload(relayConn net.PacketConn, peer *net.UDPAddr, data []byte) error {
+	maxPayload := maxDataPayload(relayConn)
+	clampTCPMSS(data, maxPayload)
 	if len(data) <= maxPayload {
 		pkt := buildPacket(msgTypeIP, 0, data)
-		wrapped, err := wrapPacket(sec, pkt)
-		if err != nil {
-			return err
-		}
-		_, err = relayConn.WriteTo(wrapped, peer)
+		_, err := relayConn.WriteTo(pkt, peer)
 		return err
 	}
-	return sendFragPackets(relayConn, peer, sec, data, maxPayload)
+	return sendFragPackets(relayConn, peer, data, maxPayload)
 }
 
-func sendFragPackets(relayConn net.PacketConn, peer *net.UDPAddr, sec *secureSession, pkt []byte, maxPayload int) error {
+func sendFragPackets(relayConn net.PacketConn, peer *net.UDPAddr, pkt []byte, maxPayload int) error {
 	payloadMax := maxPayload - fragHeaderLen
 	if payloadMax <= 0 {
 		return fmt.Errorf("max payload too small for fragmentation")
@@ -395,18 +221,14 @@ func sendFragPackets(relayConn net.PacketConn, peer *net.UDPAddr, sec *secureSes
 		copy(frag[fragHeaderLen:], pkt[off:end])
 
 		dataPkt := buildPacket(msgTypeFrag, 0, frag)
-		wrapped, err := wrapPacket(sec, dataPkt)
-		if err != nil {
-			return err
-		}
-		if _, err := relayConn.WriteTo(wrapped, peer); err != nil {
+		if _, err := relayConn.WriteTo(dataPkt, peer); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func turnToTunLoop(relayConn net.PacketConn, tun *tunDevice, sec *secureSession, reasm *fragReassembler, verbose int) error {
+func turnToTunLoop(relayConn net.PacketConn, tun io.Writer, reasm *fragReassembler, verbose int) error {
 	cleanupTicker := time.NewTicker(2 * time.Second)
 	defer cleanupTicker.Stop()
 	buf := make([]byte, 64*1024)
@@ -421,6 +243,6 @@ func turnToTunLoop(relayConn net.PacketConn, tun *tunDevice, sec *secureSession,
 		if err != nil {
 			return err
 		}
-		handleTunInbound(buf[:n], tun, sec, reasm, verbose)
+		handleTunInbound(buf[:n], tun, reasm, verbose)
 	}
 }

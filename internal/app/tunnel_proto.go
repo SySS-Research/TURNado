@@ -14,8 +14,13 @@ type tunnelHeader struct {
 
 // Header: [ver:1][type:1][connID:4]
 const (
-	tunnelHeaderLen = 6
-	maxPacketSize   = 1200
+	tunnelProtoVersion = 1
+	msgTypeIP          = 4
+	msgTypeFrag        = 6
+	msgTypePing        = 7
+	msgTypePong        = 8
+	tunnelHeaderLen    = 6
+	maxPacketSize      = 1200
 )
 
 func buildPacket(msgType byte, connID uint32, payload []byte) []byte {
@@ -41,9 +46,9 @@ func parseHeader(pkt []byte) (tunnelHeader, []byte, error) {
 	return h, pkt[tunnelHeaderLen:], nil
 }
 
-func maxDataPayload(sec *secureSession) int {
-	if sec != nil && sec.enabled {
-		return maxPacketSize - (2 * tunnelHeaderLen) - aesIVLen
+func maxDataPayload(conn net.PacketConn) int {
+	if t, ok := conn.(*peerTransport); ok {
+		return t.maxPayload()
 	}
 	return maxPacketSize - tunnelHeaderLen
 }

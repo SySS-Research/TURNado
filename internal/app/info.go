@@ -7,22 +7,41 @@ import (
 	"log"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/pion/stun"
+	"github.com/pion/stun/v3"
 	"github.com/spf13/pflag"
 )
 
 const (
 	turnAllocateMethod stun.Method   = 0x003
 	attrRequestedTrans stun.AttrType = 0x0019
+	maxRelayProbeWait                = 2 * time.Second
 )
 
-func probeServerInfo(cfg commonConfig, requestedProto byte) (string, string, error) {
+var (
+	// Addresses that can reach the TURN host itself. A STUN Binding response
+	// from the TURN port proves that the relay forwarded traffic to it.
+	loopbackPeers = []string{"127.0.0.1", "::1", "0.0.0.0", "127.0.0.2", "::", "64:ff9b::7f00:1"}
+	// Internal ranges whose permission policy is surveyed without traffic.
+	internalPeers = []string{"10.0.0.1", "172.16.0.1", "192.168.0.1", "100.64.0.1", "169.254.169.254"}
+)
+
+// serverHello is the answer to an unauthenticated Allocate. It reveals the
+// realm and software, and whether allocations work without credentials.
+type serverHello struct {
+	Realm, Software string
+	Code            int // 0 = success, -1 = error response without ERROR-CODE
+	Reason          string
+}
+
+func probeServerInfo(cfg commonConfig, requestedProto byte) (serverHello, error) {
+	var hello serverHello
 	pc, closeFn, err := dialControlConn(cfg)
 	if err != nil {
-		return "", "", err
+		return hello, err
 	}
 	defer func() { _ = closeFn() }()
 
@@ -42,42 +61,48 @@ func probeServerInfo(cfg commonConfig, requestedProto byte) (string, string, err
 	if cfg.Transport == "udp" {
 		ua, rerr := net.ResolveUDPAddr("udp", cfg.Turn)
 		if rerr != nil {
-			return "", "", rerr
+			return hello, rerr
 		}
 		if _, err := pc.WriteTo(m.Raw, ua); err != nil {
-			return "", "", fmt.Errorf("write allocate probe failed: %w", err)
+			return hello, fmt.Errorf("write allocate probe failed: %w", err)
 		}
 	} else {
 		if _, err := pc.WriteTo(m.Raw, nil); err != nil {
 			if _, werr := pc.WriteTo(m.Raw, &net.UDPAddr{}); werr != nil {
-				return "", "", fmt.Errorf("write allocate probe failed: %w", err)
+				return hello, fmt.Errorf("write allocate probe failed: %w", err)
 			}
 		}
 	}
 
 	buf := make([]byte, 2048)
-	n, _, err := pc.ReadFrom(buf)
-	if err != nil {
-		return "", "", fmt.Errorf("read allocate probe failed: %w", err)
-	}
-
 	var resp stun.Message
-	resp.Raw = append([]byte(nil), buf[:n]...)
-	if err := resp.Decode(); err != nil {
-		return "", "", fmt.Errorf("decode allocate probe failed: %w", err)
+	for {
+		n, _, err := pc.ReadFrom(buf)
+		if err != nil {
+			return hello, fmt.Errorf("read allocate probe failed: %w", err)
+		}
+		resp = stun.Message{Raw: append([]byte(nil), buf[:n]...)}
+		if resp.Decode() == nil && resp.TransactionID == txID {
+			break
+		}
 	}
 
 	var r stun.Realm
 	var s stun.Software
-	realm := ""
-	software := ""
-	if getErr := r.GetFrom(&resp); getErr == nil {
-		realm = string(r)
+	if r.GetFrom(&resp) == nil {
+		hello.Realm = string(r)
 	}
-	if getErr := s.GetFrom(&resp); getErr == nil {
-		software = string(s)
+	if s.GetFrom(&resp) == nil {
+		hello.Software = string(s)
 	}
-	return realm, software, nil
+	if resp.Type.Class == stun.ClassErrorResponse {
+		hello.Code = -1
+		var attr stun.ErrorCodeAttribute
+		if attr.GetFrom(&resp) == nil {
+			hello.Code, hello.Reason = int(attr.Code), string(attr.Reason)
+		}
+	}
+	return hello, nil
 }
 
 func pickIP(host string) (net.IP, error) {
@@ -131,11 +156,92 @@ func dialTurnDataConn(cfg commonConfig) (net.Conn, error) {
 	return dialServerTCP(cfg)
 }
 
-func isConnectBindSupported(err error) bool {
-	if err == nil {
-		return true
+// rfc6062Transport picks the control transport for RFC 6062 TCP allocations.
+// They need a stream connection, so DTLS maps to TLS on the same port.
+func rfc6062Transport(transport string) string {
+	if transport == "tls" || transport == "dtls" {
+		return "tls"
 	}
-	return strings.Contains(err.Error(), "error 447")
+	return "tcp"
+}
+
+// probeRelayResponses sends one STUN Binding request through the relay to
+// each target and collects answers until all arrived or the wait expired. An
+// answer proves that the relay delivered the request and carried the reply
+// back; no answer is inconclusive because the target might not speak STUN.
+// Answers are matched by transaction ID, so a reply from another address
+// (e.g. 127.0.0.1 answering for 0.0.0.0) counts and is reported as such.
+// It returns each target's responder ("" without answer) and send error.
+func probeRelayResponses(relay net.PacketConn, targets []*net.UDPAddr, wait time.Duration) ([]string, []error) {
+	responders := make([]string, len(targets))
+	sendErrs := make([]error, len(targets))
+	pending := make(map[[stun.TransactionIDSize]byte]int, len(targets))
+	for i, target := range targets {
+		var txID [stun.TransactionIDSize]byte
+		if _, err := rand.Read(txID[:]); err != nil {
+			sendErrs[i] = err
+			continue
+		}
+		m := stun.Message{Raw: make([]byte, 0, 64), Type: stun.NewType(stun.MethodBinding, stun.ClassRequest), TransactionID: txID}
+		m.Encode()
+		if _, err := relay.WriteTo(m.Raw, target); err != nil {
+			sendErrs[i] = err
+			continue
+		}
+		pending[txID] = i
+	}
+	if wait <= 0 || wait > maxRelayProbeWait {
+		wait = maxRelayProbeWait
+	}
+	if len(pending) == 0 || relay.SetReadDeadline(time.Now().Add(wait)) != nil {
+		return responders, sendErrs
+	}
+	defer relay.SetReadDeadline(time.Time{})
+	buf := make([]byte, 2048)
+	for len(pending) > 0 {
+		n, from, err := relay.ReadFrom(buf)
+		if err != nil {
+			break // Deadline reached or relay closed: the rest stays unanswered.
+		}
+		resp := stun.Message{Raw: append([]byte(nil), buf[:n]...)}
+		if resp.Decode() != nil || resp.Type.Method != stun.MethodBinding || resp.Type.Class == stun.ClassRequest || resp.Type.Class == stun.ClassIndication {
+			continue
+		}
+		if i, ok := pending[resp.TransactionID]; ok {
+			responders[i] = from.String()
+			delete(pending, resp.TransactionID)
+		}
+	}
+	return responders, sendErrs
+}
+
+// probePeers surveys which peer permissions the server grants and, for the
+// addresses of the TURN host itself, whether the relay actually reaches them.
+func probePeers(client permissionClient, relay net.PacketConn, port int, external *net.UDPAddr, label string, wait time.Duration) ([]peerProbe, peerProbe) {
+	var peers []peerProbe
+	var targets []*net.UDPAddr
+	var probed []*peerProbe
+	addPeer := func(p *peerProbe, addr *net.UDPAddr, sendSTUN bool) {
+		p.Permission = client.CreatePermission(addr)
+		if p.Permission == nil && sendSTUN {
+			p.Tested = true
+			targets = append(targets, addr)
+			probed = append(probed, p)
+		}
+	}
+	all := append(append([]string{}, loopbackPeers...), internalPeers...)
+	peers = make([]peerProbe, len(all))
+	for i, address := range all {
+		peers[i].Address = address
+		addPeer(&peers[i], &net.UDPAddr{IP: net.ParseIP(address), Port: port}, i < len(loopbackPeers))
+	}
+	ext := peerProbe{Address: label}
+	addPeer(&ext, external, true)
+	responders, sendErrs := probeRelayResponses(relay, targets, wait)
+	for i, p := range probed {
+		p.ResponseFrom, p.SendErr = responders[i], sendErrs[i]
+	}
+	return peers, ext
 }
 
 func RunInfo(argv []string) error {
@@ -149,12 +255,14 @@ func RunInfo(argv []string) error {
 	addCommonFlags(fs, &cfg)
 
 	help := fs.BoolP("help", "h", false, "Show help message")
-	probeAddr := fs.StringP("probe", "a", "", "External address for permission/data probe (ip:port) (default: TURN server:port)")
+	probeAddr := fs.StringP("probe", "a", "", "External ip:port for the permission, relay and TCP CONNECT probes (default: TURN server:port)")
+	jsonOutput := fs.Bool("json", false, "Print machine-readable results")
 
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stdout, "Usage: turnado info [options]")
 		fs.SetOutput(os.Stdout)
 		fs.PrintDefaults()
+		printModeExamples(os.Stdout, "info")
 		fs.SetOutput(origOut)
 	}
 
@@ -165,6 +273,9 @@ func RunInfo(argv []string) error {
 		fs.Usage()
 		return nil
 	}
+	if err := resolveCommonFlags(fs, &cfg); err != nil {
+		return err
+	}
 	if err := requireTurn(fs, cfg.Turn); err != nil {
 		return err
 	}
@@ -174,194 +285,120 @@ func RunInfo(argv []string) error {
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
+	_, portStr, err := net.SplitHostPort(cfg.Turn)
+	if err != nil {
+		return fmt.Errorf("invalid TURN address: %w", err)
+	}
+	turnPort, err := strconv.Atoi(portStr)
+	if err != nil || turnPort < 1 || turnPort > 65535 {
+		return fmt.Errorf("invalid TURN port %q", portStr)
+	}
 	probeUDP, probeTCP, probeLabel, err := resolveProbeAddrs(cfg.Turn, *probeAddr)
 	if err != nil {
 		return err
 	}
+	report := infoReport{
+		Turn: cfg.Turn, Transport: cfg.Transport, Probe: probeLabel, TurnPort: turnPort,
+		TCPTransport: rfc6062Transport(cfg.Transport), TCPTarget: probeTCP.String(),
+	}
+	emit := func() error {
+		if *jsonOutput {
+			return emitInfoJSON(report.jsonFields())
+		}
+		writeInfoText(os.Stdout, report)
+		return nil
+	}
 
-	realmUDP, softwareUDP, err := probeServerInfo(cfg, 17)
+	udpHello, err := probeServerInfo(cfg, 17)
+	report.AnonymousKnown, report.Anonymous = err == nil, udpHello
 	if err != nil && cfg.Verbose > 0 {
 		log.Printf("UDP realm probe failed: %v", err)
 	}
-	realmTCP, softwareTCP, err := probeServerInfo(cfg, 6)
+	tcpHello, err := probeServerInfo(cfg, 6)
 	if err != nil && cfg.Verbose > 0 {
 		log.Printf("TCP realm probe failed: %v", err)
 	}
-
-	realm := realmUDP
-	if realm == "" {
-		realm = realmTCP
+	report.Realm, report.Software = udpHello.Realm, udpHello.Software
+	if report.Realm == "" {
+		report.Realm = tcpHello.Realm
 	}
-	if realm == "" {
-		realm = "unknown"
-	}
-	software := softwareUDP
-	if software == "" {
-		software = softwareTCP
+	if report.Software == "" {
+		report.Software = tcpHello.Software
 	}
 
 	if cfg.Username == "" || cfg.Password == "" {
-		fmt.Printf("TURN server: %s\n", cfg.Turn)
-		fmt.Printf("Realm: %s\n", realm)
-		if software != "" {
-			fmt.Printf("Software: %s\n", software)
-		}
-		fmt.Printf("Probe address: %s\n", probeLabel)
-		fmt.Printf("XOR-MAPPED-ADDRESS: unavailable (missing credentials)\n")
-		fmt.Printf("External permission/data probe: skipped (missing credentials)\n")
-		return nil
+		report.Status = "missing_credentials"
+		return emit()
 	}
+	report.IPv4 = probeAllocationFamily(cfg, 1)
+	report.IPv6 = probeAllocationFamily(cfg, 2)
 
 	client, _, cleanup, err := newTurnClient(cfg)
 	if err != nil {
-		fmt.Printf("TURN server: %s\n", cfg.Turn)
-		fmt.Printf("Realm: %s\n", realm)
-		if software != "" {
-			fmt.Printf("Software: %s\n", software)
-		}
-		fmt.Printf("Probe address: %s\n", probeLabel)
-		fmt.Printf("XOR-MAPPED-ADDRESS: unavailable (auth client init failed: %v)\n", err)
-		fmt.Printf("External permission/data probe: unavailable\n")
-		return nil
+		report.Status, report.ClientErr = "auth_client_failed", err
+		return emit()
 	}
 	defer cleanup()
 
-	mapped, mapErr := client.SendBindingRequestTo(client.TURNServerAddr())
-	xorMapped := "unknown"
-	if mapErr == nil {
-		xorMapped = mapped.String()
+	if mapped, err := client.SendBindingRequestTo(client.TURNServerAddr()); err != nil {
+		report.MappedErr = err
+	} else {
+		report.Mapped = mapped.String()
 	}
 
-	relayConn, allocErr := client.Allocate()
-	if allocErr != nil {
-		fmt.Printf("TURN server: %s\n", cfg.Turn)
-		fmt.Printf("Realm: %s\n", realm)
-		if software != "" {
-			fmt.Printf("Software: %s\n", software)
-		}
-		fmt.Printf("Probe address: %s\n", probeLabel)
-		fmt.Printf("XOR-MAPPED-ADDRESS: %s\n", xorMapped)
-		fmt.Printf("External permission/data probe: allocation failed (%v)\n", allocErr)
-		return nil
+	relayConn, err := client.Allocate()
+	if err != nil {
+		report.Status, report.AllocErr = "allocation_failed", err
+		return emit()
 	}
 	defer relayConn.Close()
+	report.Relay = relayConn.LocalAddr().String()
+	report.Peers, report.External = probePeers(client, relayConn, turnPort, probeUDP, probeLabel, cfg.Timeout)
 
-	loopV4 := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 50000}
-	loopV6 := &net.UDPAddr{IP: net.ParseIP("::1"), Port: 50000}
-	loopV4Err := client.CreatePermission(loopV4)
-	loopV6Err := client.CreatePermission(loopV6)
+	tcpCfg := cfg
+	tcpCfg.Transport = report.TCPTransport
+	report.TCP = probeTCPRelay(tcpCfg, probeTCP)
+	report.Status = "ok"
+	return emit()
+}
 
-	udpPermErr := client.CreatePermission(probeUDP)
-	var udpSendErr error
-	if udpPermErr == nil {
-		payload := []byte("probe")
-		_, udpSendErr = relayConn.WriteTo(payload, probeUDP)
-	} else {
-		udpSendErr = fmt.Errorf("skipped (permission failed)")
-	}
+// tcpRelayProbe records the RFC 6062 steps. Once a step fails, the later
+// ones are skipped and stay nil.
+type tcpRelayProbe struct {
+	ClientErr, AllocErr, ConnectErr, SendErr error
+	Connected                                bool
+}
 
-	tcpProbeCfg := cfg
-	if cfg.Transport == "tls" {
-		tcpProbeCfg.Transport = "tls"
-	} else {
-		tcpProbeCfg.Transport = "tcp"
-	}
-
-	tcpAllocErr := error(nil)
-	tcpConnectBindErr := error(nil)
-	tcpSendErr := error(nil)
-	clientTCP, _, cleanupTCP, err := newTurnClient(tcpProbeCfg)
+// probeTCPRelay checks RFC 6062 support: a TCP allocation, then CONNECT and
+// ConnectionBind to the target and a short write on the data connection.
+func probeTCPRelay(cfg commonConfig, target *net.TCPAddr) tcpRelayProbe {
+	var p tcpRelayProbe
+	client, _, cleanup, err := newTurnClient(cfg)
 	if err != nil {
-		tcpAllocErr = err
-		tcpConnectBindErr = fmt.Errorf("skipped (allocation failed)")
-		tcpSendErr = fmt.Errorf("skipped (allocation failed)")
-	} else {
-		defer cleanupTCP()
-		tcpAlloc, err := clientTCP.AllocateTCP()
-		if err != nil {
-			tcpAllocErr = err
-			tcpConnectBindErr = fmt.Errorf("skipped (allocation failed)")
-			tcpSendErr = fmt.Errorf("skipped (allocation failed)")
-		} else {
-			defer tcpAlloc.Close()
-			dataConn, err := dialTurnDataConn(tcpProbeCfg)
-			if err != nil {
-				tcpConnectBindErr = err
-				tcpSendErr = err
-			} else {
-				conn, err := tcpAlloc.DialTCPWithConn(dataConn, "tcp", probeTCP)
-				if err != nil {
-					_ = dataConn.Close()
-					tcpConnectBindErr = err
-					tcpSendErr = err
-				} else {
-					tcpConnectBindErr = nil
-					_ = conn.SetWriteDeadline(time.Now().Add(cfg.Timeout))
-					_, tcpSendErr = conn.Write([]byte("probe"))
-					_ = conn.Close()
-				}
-			}
-		}
+		p.ClientErr = err
+		return p
 	}
-
-	if tcpAllocErr != nil {
-		tcpConnectBindErr = fmt.Errorf("skipped (allocation failed)")
-		if tcpSendErr == nil {
-			tcpSendErr = fmt.Errorf("skipped (allocation failed)")
-		}
+	defer cleanup()
+	allocation, err := client.AllocateTCP()
+	if err != nil {
+		p.AllocErr = err
+		return p
 	}
-
-	fmt.Printf("TURN server: %s\n", cfg.Turn)
-	fmt.Printf("Realm: %s\n", realm)
-	if software != "" {
-		fmt.Printf("Software: %s\n", software)
+	defer allocation.Close()
+	dataConn, err := dialTurnDataConn(cfg)
+	if err != nil {
+		p.ConnectErr = fmt.Errorf("data connection: %w", err)
+		return p
 	}
-	fmt.Printf("Probe address: %s\n", probeLabel)
-	fmt.Printf("XOR-MAPPED-ADDRESS: %s\n", xorMapped)
-
-	fmt.Printf("Permission to 127.0.0.1 allowed: %v", loopV4Err == nil)
-	if loopV4Err != nil {
-		fmt.Printf(" (error: %v)", loopV4Err)
+	conn, err := allocation.DialTCPWithConn(asTURNTCPConn(dataConn), "tcp", target)
+	if err != nil {
+		_ = dataConn.Close()
+		p.ConnectErr = err
+		return p
 	}
-	fmt.Println()
-
-	fmt.Printf("Permission to ::1 allowed: %v", loopV6Err == nil)
-	if loopV6Err != nil {
-		fmt.Printf(" (error: %v)", loopV6Err)
-	}
-	fmt.Println()
-
-	fmt.Printf("UDP permission allowed: %v", udpPermErr == nil)
-	if udpPermErr != nil {
-		fmt.Printf(" (error: %v)", udpPermErr)
-	}
-	fmt.Println()
-
-	fmt.Printf("UDP data send: %v", udpSendErr == nil)
-	if udpSendErr != nil {
-		fmt.Printf(" (error: %v)", udpSendErr)
-	}
-	fmt.Println()
-
-	fmt.Printf("TCP allocation allowed: %v", tcpAllocErr == nil)
-	if tcpAllocErr != nil {
-		fmt.Printf(" (error: %v)", tcpAllocErr)
-	}
-	fmt.Println()
-
-	if tcpAllocErr == nil || cfg.Verbose > 0 {
-		fmt.Printf("TCP connect/bind supported: %v", isConnectBindSupported(tcpConnectBindErr))
-		if tcpConnectBindErr != nil {
-			fmt.Printf(" (error: %v)", tcpConnectBindErr)
-		}
-		fmt.Println()
-
-		fmt.Printf("TCP data send: %v", tcpSendErr == nil)
-		if tcpSendErr != nil {
-			fmt.Printf(" (error: %v)", tcpSendErr)
-		}
-		fmt.Println()
-	}
-
-	return nil
+	p.Connected = true
+	_ = conn.SetWriteDeadline(time.Now().Add(cfg.Timeout))
+	_, p.SendErr = conn.Write([]byte("probe"))
+	_ = conn.Close()
+	return p
 }

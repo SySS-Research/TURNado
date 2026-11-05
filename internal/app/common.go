@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/pion/logging"
-	"github.com/pion/turn/v2"
+	"github.com/pion/turn/v4"
 	"github.com/spf13/pflag"
 )
 
@@ -26,20 +26,28 @@ type commonConfig struct {
 	Verbose   int
 	Software  string
 	Proxy     string
+
+	transportSet bool // -T given explicitly; a connection string must not override it.
 }
 
 func addCommonFlags(fs *pflag.FlagSet, cfg *commonConfig) {
 	fs.StringVarP(&cfg.Turn, "turn", "t", "", "TURN server address (host:port) (required)")
-	fs.StringVarP(&cfg.Username, "username", "u", "", "TURN username")
-	fs.StringVarP(&cfg.Password, "password", "p", "", "TURN password")
+	fs.StringVarP(&cfg.Username, "username", "u", "", "TURN username (default $"+envUsername+")")
+	fs.StringVarP(&cfg.Password, "password", "p", "", "TURN password (\"-\" prompts; default $"+envPassword+")")
 
-	fs.StringVarP(&cfg.Transport, "transport", "T", "udp", "Transport type (udp|tcp|tls)")
+	fs.StringVarP(&cfg.Transport, "transport", "T", "udp", "Transport type (udp|tcp|tls|dtls)")
 	fs.BoolVarP(&cfg.Insecure, "insecure", "k", false, "Skip TLS certificate verification")
 
 	fs.DurationVarP(&cfg.Timeout, "timeout", "o", 10*time.Second, "Dial timeout for control connection")
 	fs.IntVarP(&cfg.Verbose, "verbose", "v", 0, "Verbosity level (0=quiet, 1=verbose, 2=very verbose)")
 
 	fs.StringVar(&cfg.Proxy, "proxy", "", "Route the connection to the TURN server through a proxy (socks5://[user:pass@]host:port or http://[user:pass@]host:port). Requires -T tcp or -T tls.")
+}
+
+// resolveCommonFlags records flag state that is only known after parsing.
+func resolveCommonFlags(fs *pflag.FlagSet, cfg *commonConfig) error {
+	cfg.transportSet = fs.Changed("transport")
+	return resolveCredentials(cfg)
 }
 
 func requireTurn(fs *pflag.FlagSet, turn string) error {
@@ -55,8 +63,8 @@ func validateCommon(cfg commonConfig) error {
 	if cfg.Proxy == "" {
 		return nil
 	}
-	if cfg.Transport == "udp" {
-		return errors.New("--proxy requires -T tcp or -T tls (SOCKS/HTTP proxies cannot tunnel UDP)")
+	if cfg.Transport == "udp" || cfg.Transport == "dtls" {
+		return errors.New("--proxy requires -T tcp or -T tls (SOCKS/HTTP proxies cannot tunnel UDP/DTLS)")
 	}
 	u, err := url.Parse(cfg.Proxy)
 	if err != nil {
@@ -125,7 +133,15 @@ func dialControlConn(cfg commonConfig) (net.PacketConn, func() error, error) {
 		if cfg.Proxy != "" {
 			return nil, nil, errors.New("--proxy is not supported with UDP transport (SOCKS/HTTP proxies only tunnel TCP); use -T tcp or -T tls")
 		}
-		pc, err := net.ListenPacket("udp4", "0.0.0.0:0")
+		server, err := net.ResolveUDPAddr("udp", cfg.Turn)
+		if err != nil {
+			return nil, nil, fmt.Errorf("resolve TURN server: %w", err)
+		}
+		network, listenAddr := "udp4", "0.0.0.0:0"
+		if server.IP.To4() == nil {
+			network, listenAddr = "udp6", "[::]:0"
+		}
+		pc, err := net.ListenPacket(network, listenAddr)
 		if err != nil {
 			return nil, nil, fmt.Errorf("ListenPacket(udp) failed: %w", err)
 		}
@@ -144,8 +160,17 @@ func dialControlConn(cfg commonConfig) (net.PacketConn, func() error, error) {
 		}
 		pc := turn.NewSTUNConn(c)
 		return pc, pc.Close, nil
+	case "dtls":
+		if cfg.Proxy != "" {
+			return nil, nil, errors.New("--proxy is not supported with DTLS transport")
+		}
+		pc, err := dialDTLSControl(cfg)
+		if err != nil {
+			return nil, nil, err
+		}
+		return pc, pc.Close, nil
 	default:
-		return nil, nil, fmt.Errorf("unsupported transport %q (use udp, tcp, or tls)", cfg.Transport)
+		return nil, nil, fmt.Errorf("unsupported transport %q (use udp, tcp, tls, or dtls)", cfg.Transport)
 	}
 }
 
@@ -190,6 +215,8 @@ func newTurnClient(cfg commonConfig) (*turn.Client, net.PacketConn, func(), erro
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	pc = observeControlConn(pc)
+	closeFn = pc.Close
 
 	if cfg.Verbose > 1 {
 		if cfg.Proxy != "" {

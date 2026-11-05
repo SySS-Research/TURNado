@@ -1,0 +1,15 @@
+services:
+  restricted:
+    image: coturn/coturn:latest
+    network_mode: host
+    volumes:
+      - ./restricted.conf:/etc/coturn/turnserver.conf:ro
+    restart: "no"
+
+  permissive:
+    image: coturn/coturn:latest
+    network_mode: host
+    profiles: [permissive]
+    volumes:
+      - ./permissive.conf:/etc/coturn/turnserver.conf:ro
+    restart: "no"

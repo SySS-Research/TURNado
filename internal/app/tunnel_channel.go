@@ -6,19 +6,16 @@ import (
 	"time"
 )
 
-func primeChannel(relayConn net.PacketConn, peer *net.UDPAddr, sec *secureSession, verbose int) {
+func primeChannel(relayConn net.PacketConn, peer *net.UDPAddr, verbose int) {
 	if relayConn == nil || peer == nil {
 		return
 	}
 	if verbose > 1 {
 		log.Printf("Priming channel bind to %s", peer.String())
 	}
-	dummy := buildPacket(msgTypeData, 0, []byte{0})
+	dummy := buildPacket(msgTypePing, 0, nil)
 	for i := 0; i < 3; i++ {
-		pkt, err := wrapPacket(sec, dummy)
-		if err == nil {
-			_, _ = relayConn.WriteTo(pkt, peer)
-		}
+		_, _ = relayConn.WriteTo(dummy, peer)
 		time.Sleep(100 * time.Millisecond)
 	}
 }

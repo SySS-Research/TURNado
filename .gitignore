@@ -9,5 +9,4 @@
 *.log
 /turnado
 /turnado.exe
-go.sum
 .gocache/

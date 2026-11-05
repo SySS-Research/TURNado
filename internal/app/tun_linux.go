@@ -10,29 +10,19 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+const tunSupported = true
+
 type tunDevice struct {
 	file *os.File
 	name string
 }
 
 func (t *tunDevice) Read(b []byte) (int, error) {
-	for {
-		n, err := unix.Read(int(t.file.Fd()), b)
-		if err == unix.EINTR {
-			continue
-		}
-		return n, err
-	}
+	return t.file.Read(b)
 }
 
 func (t *tunDevice) Write(b []byte) (int, error) {
-	for {
-		n, err := unix.Write(int(t.file.Fd()), b)
-		if err == unix.EINTR {
-			continue
-		}
-		return n, err
-	}
+	return t.file.Write(b)
 }
 
 func (t *tunDevice) Close() error {
@@ -42,7 +32,8 @@ func (t *tunDevice) Close() error {
 	return t.file.Close()
 }
 
-func configureTun(name, ipStr, maskStr string) error {
+func configureTun(name, ipStr, peerIP, maskStr string, mtu int) error {
+	_ = peerIP
 	if name == "" {
 		return fmt.Errorf("missing tun name")
 	}
@@ -82,6 +73,17 @@ func configureTun(name, ipStr, maskStr string) error {
 	if err := unix.IoctlIfreq(fd, unix.SIOCSIFNETMASK, ifr); err != nil {
 		return fmt.Errorf("SIOCSIFNETMASK failed: %w", err)
 	}
+	if mtu < 576 || mtu > 65535 {
+		return fmt.Errorf("invalid tun MTU %d", mtu)
+	}
+	ifr, err = unix.NewIfreq(name)
+	if err != nil {
+		return fmt.Errorf("invalid tun name %q: %w", name, err)
+	}
+	ifr.SetUint32(uint32(mtu))
+	if err := unix.IoctlIfreq(fd, unix.SIOCSIFMTU, ifr); err != nil {
+		return fmt.Errorf("SIOCSIFMTU failed: %w", err)
+	}
 
 	ifr, err = unix.NewIfreq(name)
 	if err != nil {
@@ -104,25 +106,27 @@ func openTun(name string) (*tunDevice, error) {
 	if name == "" {
 		name = "turn%d"
 	}
-	f, err := os.OpenFile("/dev/net/tun", os.O_RDWR, 0)
+	// Keep the descriptor nonblocking so os.File uses the runtime poller.
+	// Closing it then wakes both pumps when the TURN control connection fails.
+	fd, err := unix.Open("/dev/net/tun", unix.O_RDWR|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, fmt.Errorf("open /dev/net/tun failed: %w", err)
 	}
 
 	ifr, err := unix.NewIfreq(name)
 	if err != nil {
-		_ = f.Close()
+		_ = unix.Close(fd)
 		return nil, fmt.Errorf("invalid tun name %q: %w", name, err)
 	}
 	ifr.SetUint16(unix.IFF_TUN | unix.IFF_NO_PI)
 
-	if err := unix.IoctlIfreq(int(f.Fd()), unix.TUNSETIFF, ifr); err != nil {
-		_ = f.Close()
+	if err := unix.IoctlIfreq(fd, unix.TUNSETIFF, ifr); err != nil {
+		_ = unix.Close(fd)
 		return nil, fmt.Errorf("TUNSETIFF failed: %w", err)
 	}
 
 	return &tunDevice{
-		file: f,
+		file: os.NewFile(uintptr(fd), "/dev/net/tun"),
 		name: ifr.Name(),
 	}, nil
 }
