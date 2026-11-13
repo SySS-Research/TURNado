@@ -12,6 +12,7 @@ func Modes() []Mode {
 	modes := []Mode{
 		{"info", "Inspect TURN server capabilities", RunInfo},
 		{"scan", "Test TCP targets from the TURN server via RFC 6062", RunScan},
+		{"tcprelay", "Send data to a TCP target through TURN", RunTCPRelay},
 		{"socks", "SOCKS5-over-TURN UDP tunnel", RunSocks},
 	}
 	if tunSupported {

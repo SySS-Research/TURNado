@@ -15,6 +15,7 @@ The following modes are implemented:
 
 - `info`: Inspect TURN server details and probe UDP/TCP capabilities.
 - `scan`: Probe TCP targets using RFC 6062 CONNECT requests from the TURN server.
+- `tcprelay`: Send `tcpoverturn` to a TCP target through an RFC 6062 TURN data connection.
 - `socks`: SOCKS5-over-TURN tunnel.
 - `tunnel`: Full IP tunnel for tunneling arbitrary traffic through TURN.
 - `forward`: UDP forwarder over TURN.
@@ -122,6 +123,14 @@ RFC 6062 requires a TCP or TLS control connection; `scan` and `socks --direct` u
 ```sh
 turnado scan -t turn.example.com:3478 -u user -p - -a 192.0.2.10:80 -a 192.0.2.10:443 --json
 turnado scan -t turn.example.com:3478 -u user -p - --targets-file targets.txt
+```
+
+### tcprelay
+
+`tcprelay` creates a TCP allocation, asks the TURN server to CONNECT to the target, binds a client data connection with ConnectionBind, then sends `tcpoverturn` over that data channel. Select `-T tcp` or `-T tls` for the RFC 6062 control connection.
+
+```sh
+turnado tcprelay -t turn.example.com:3478 -T tcp -u user -p - -a example.org:443
 ```
 
 The target file contains one `ip:port` per line; empty lines and lines starting with `#` are ignored. `--json` returns an array of `{target, reachable, error}` objects.

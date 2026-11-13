@@ -12,6 +12,9 @@ var modeExamples = map[string][]string{
 	"scan": {
 		"turnado scan -t turn.example.org:3478 -T tcp -u user -p - -a example.org:443",
 	},
+	"tcprelay": {
+		"turnado tcprelay -t turn.example.org:3478 -T tcp -u user -p - -a example.org:443",
+	},
 	"socks": {
 		"turnado socks -t turn.example.org:3478 -u user -p -",
 		"turnado socks -c OFFER",
@@ -32,6 +35,7 @@ var modeExamples = map[string][]string{
 var modeRequirements = map[string]string{
 	"info":    "UDP checks work without RFC 6062; TCP allocation/CONNECT checks require RFC 6062.",
 	"scan":    "Requires RFC 6062 TCP allocations and CONNECT support on the TURN server.",
+	"tcprelay": "Requires RFC 6062 TCP allocations, CONNECT and ConnectionBind support on the TURN server.",
 	"socks":   "Paired SOCKS uses TURN UDP allocations. Only --direct requires RFC 6062 TCP allocations (CONNECT only).",
 	"tunnel":  "Uses TURN UDP allocations; RFC 6062 is not required.",
 	"forward": "Uses a TURN UDP allocation; RFC 6062 is not required.",
